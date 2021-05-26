@@ -20,16 +20,18 @@
 package plugin
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -44,23 +46,26 @@ import (
 
 	"github.com/k8snetworkplumbingwg/ovs-cni/pkg/ovsdb"
 	"github.com/k8snetworkplumbingwg/ovs-cni/pkg/sriov"
+	"github.com/k8snetworkplumbingwg/ovs-cni/pkg/utils"
 )
 
 const (
 	macSetupRetries        = 2
 	linkstateCheckRetries  = 5
-	linkStateCheckInterval = 500 * time.Millisecond
+	linkStateCheckInterval = 600 * time.Millisecond
 )
 
 type netConf struct {
 	types.NetConf
-	BrName            string   `json:"bridge,omitempty"`
-	VlanTag           *uint    `json:"vlan"`
-	MTU               int      `json:"mtu"`
-	Trunk             []*trunk `json:"trunk,omitempty"`
-	DeviceID          string   `json:"deviceID"` // PCI address of a VF in valid sysfs format
-	ConfigurationPath string   `json:"configuration_path"`
-	SocketFile        string   `json:"socket_file"`
+	BrName                 string   `json:"bridge,omitempty"`
+	VlanTag                *uint    `json:"vlan"`
+	MTU                    int      `json:"mtu"`
+	Trunk                  []*trunk `json:"trunk,omitempty"`
+	DeviceID               string   `json:"deviceID"` // PCI address of a VF in valid sysfs format
+	ConfigurationPath      string   `json:"configuration_path"`
+	SocketFile             string   `json:"socket_file"`
+	LinkStateCheckRetries  int      `json:"link_state_check_retries"`
+	LinkStateCheckInterval int32    `json:"link_state_check_interval"`
 }
 
 type trunk struct {
@@ -387,6 +392,11 @@ func CmdAdd(args *skel.CmdArgs) error {
 	}
 	defer contNetns.Close()
 
+	// Cache NetConf for CmdDel
+	if err = utils.SaveConf(args.ContainerID, args.IfName, "netconf", netconf); err != nil {
+		return fmt.Errorf("error saving NetConf %q", err)
+	}
+
 	var hostIface, contIface *current.Interface
 	if netconf.DeviceID != "" {
 		// SR-IOV Case
@@ -413,15 +423,14 @@ func CmdAdd(args *skel.CmdArgs) error {
 	// run the IPAM plugin
 	if netconf.IPAM.Type != "" {
 		r, err := ipam.ExecAdd(netconf.IPAM.Type, args.StdinData)
-		if err != nil {
-			return fmt.Errorf("failed to set up IPAM plugin type %q: %v", netconf.IPAM.Type, err)
-		}
-
 		defer func() {
 			if err != nil {
 				ipam.ExecDel(netconf.IPAM.Type, args.StdinData)
 			}
 		}()
+		if err != nil {
+			return fmt.Errorf("failed to set up IPAM plugin type %q: %v", netconf.IPAM.Type, err)
+		}
 
 		// Convert the IPAM result into the current Result type
 		newResult, err := current.NewResultFromResult(r)
@@ -443,7 +452,7 @@ func CmdAdd(args *skel.CmdArgs) error {
 
 		// wait until OF port link state becomes up. This is needed to make
 		// gratuitous arp for args.IfName to be sent over ovs bridge
-		err = waitLinkUp(ovsDriver, hostIface.Name)
+		err = waitLinkUp(ovsDriver, hostIface.Name, netconf)
 		if err != nil {
 			return err
 		}
@@ -488,8 +497,16 @@ func CmdAdd(args *skel.CmdArgs) error {
 	return types.PrintResult(result, netconf.CNIVersion)
 }
 
-func waitLinkUp(ovsDriver *ovsdb.OvsBridgeDriver, ofPortName string) error {
-	for i := 1; i <= linkstateCheckRetries; i++ {
+func waitLinkUp(ovsDriver *ovsdb.OvsBridgeDriver, ofPortName string, netConf *netConf) error {
+	retries := linkstateCheckRetries
+	interval := linkStateCheckInterval
+	if netConf.LinkStateCheckRetries != 0 {
+		retries = netConf.LinkStateCheckRetries
+	}
+	if netConf.LinkStateCheckInterval != 0 {
+		interval = time.Duration(netConf.LinkStateCheckInterval) * time.Millisecond
+	}
+	for i := 1; i <= retries; i++ {
 		portState, err := ovsDriver.GetOFPortOpState(ofPortName)
 		if err != nil {
 			log.Printf("error in retrieving port %s state: %v", ofPortName, err)
@@ -498,10 +515,10 @@ func waitLinkUp(ovsDriver *ovsdb.OvsBridgeDriver, ofPortName string) error {
 				break
 			}
 		}
-		if i == linkstateCheckRetries {
+		if i == retries {
 			return fmt.Errorf("The OF port %s state is not up", ofPortName)
 		}
-		time.Sleep(linkStateCheckInterval)
+		time.Sleep(interval)
 	}
 	return nil
 }
@@ -537,6 +554,24 @@ func removeOvsPort(ovsDriver *ovsdb.OvsBridgeDriver, portName string) error {
 func CmdDel(args *skel.CmdArgs) error {
 	logCall("DEL", args)
 
+	netconf, cRefPath, err := loadConfFromCache(args)
+	if err != nil {
+		// If cmdDel() fails, cached netconf is cleaned up by
+		// the followed defer call. However, subsequence calls
+		// of cmdDel() from kubelet fail in a dead loop due to
+		// cached netconf doesn't exist.
+		// Return nil when LoadConfFromCache fails since the rest
+		// of cmdDel() code relies on netconf as input argument
+		// and there is no meaning to continue.
+		return nil
+	}
+
+	defer func() {
+		if err == nil && cRefPath != "" {
+			utils.CleanCachedConf(cRefPath)
+		}
+	}()
+
 	envArgs, err := getEnvArgs(args.Args)
 	if err != nil {
 		return err
@@ -547,19 +582,6 @@ func CmdDel(args *skel.CmdArgs) error {
 		ovnPort = string(envArgs.OvnPort)
 	}
 
-	netconf, err := loadNetConf(args.StdinData)
-	if err != nil {
-		return err
-	}
-	flatNetConf, err := loadFlatNetConf(netconf.ConfigurationPath)
-	if err != nil {
-		return err
-	}
-	netconf, err = mergeConf(netconf, flatNetConf)
-	if err != nil {
-		return err
-	}
-
 	bridgeName, err := getBridgeName(netconf.BrName, ovnPort)
 	if err != nil {
 		return err
@@ -568,13 +590,6 @@ func CmdDel(args *skel.CmdArgs) error {
 	ovsDriver, err := ovsdb.NewOvsBridgeDriver(bridgeName, netconf.SocketFile)
 	if err != nil {
 		return err
-	}
-
-	if netconf.IPAM.Type != "" {
-		err = ipam.ExecDel(netconf.IPAM.Type, args.StdinData)
-		if err != nil {
-			return err
-		}
 	}
 
 	if args.Netns == "" {
@@ -639,6 +654,13 @@ func CmdDel(args *skel.CmdArgs) error {
 		})
 	}
 
+	if netconf.IPAM.Type != "" {
+		err = ipam.ExecDel(netconf.IPAM.Type, args.StdinData)
+		if err != nil {
+			return err
+		}
+	}
+
 	return err
 }
 
@@ -647,4 +669,23 @@ func CmdCheck(args *skel.CmdArgs) error {
 	logCall("CHECK", args)
 	log.Print("CHECK is not yet implemented, pretending everything is fine")
 	return nil
+}
+
+func loadConfFromCache(args *skel.CmdArgs) (*netConf, string, error) {
+	netConf := &netConf{}
+
+	s := []string{args.ContainerID, args.IfName, "netconf"}
+	cRef := strings.Join(s, "-")
+	cRefPath := filepath.Join(utils.DefaultCNIDir, cRef)
+
+	netConfBytes, err := utils.ReadScratchConf(cRefPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("error reading cached NetConf in %s with name %s", utils.DefaultCNIDir, cRef)
+	}
+
+	if err = json.Unmarshal(netConfBytes, netConf); err != nil {
+		return nil, "", fmt.Errorf("failed to parse NetConf: %q", err)
+	}
+
+	return netConf, cRefPath, nil
 }

@@ -14,7 +14,7 @@
 // long running processes in go did not work in a reliable way.
 // +build go1.10
 
-package sriov
+package utils
 
 import (
 	"encoding/json"
@@ -23,8 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/containernetworking/cni/pkg/skel"
 )
 
 var (
@@ -34,13 +32,13 @@ var (
 
 // SaveConf takes in container ID, data dir and Pod interface name as string and a json encoded struct Conf
 // and save this Conf in data dir
-func SaveConf(cid, podIfName string, conf interface{}) error {
+func SaveConf(cid, podIfName, prefix string, conf interface{}) error {
 	confBytes, err := json.Marshal(conf)
 	if err != nil {
 		return fmt.Errorf("error serializing delegate conf: %v", err)
 	}
 
-	s := []string{cid, podIfName}
+	s := []string{cid, podIfName, prefix}
 	cRef := strings.Join(s, "-")
 
 	// save the rendered conf for cmdDel
@@ -66,24 +64,13 @@ func saveScratchConf(containerID, dataDir string, conf []byte) error {
 	return err
 }
 
-func readScratchConf(cRefPath string) ([]byte, error) {
+// ReadScratchConf read conf from disk and returns data in byte array
+func ReadScratchConf(cRefPath string) ([]byte, error) {
 	data, err := ioutil.ReadFile(cRefPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read container data in the path(%q): %v", cRefPath, err)
 	}
 	return data, err
-}
-
-// LoadHostIFNameFromCache retrieves cached Conf returns it along with a handle for removal
-func LoadHostIFNameFromCache(args *skel.CmdArgs) (string, string, error) {
-	s := []string{args.ContainerID, args.IfName}
-	cRef := strings.Join(s, "-")
-	cRefPath := filepath.Join(DefaultCNIDir, cRef)
-	confBytes, err := readScratchConf(cRefPath)
-	if err != nil {
-		return "", "", fmt.Errorf("error reading cached Conf in %s with name %s", DefaultCNIDir, cRef)
-	}
-	return strings.Replace(string(confBytes), "\"", "", -1), cRefPath, nil
 }
 
 // CleanCachedConf removed cached Conf from disk
